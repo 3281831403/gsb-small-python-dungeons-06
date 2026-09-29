@@ -1,417 +1,448 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Fri Aug  7 23:07:40 2020
+"""Dungeons -- a small state-based dungeon engine.
 
-@author: Legedith
+The world is described by an explicit GameState (rooms and their
+connections, monsters, doors).  Every mutation goes through
+``apply_action`` which is transactional: if an action fails, the state
+is rolled back completely, so a failed action never pollutes the state
+seen by later actions.  Save/load uses deep-copied plain-data snapshots,
+so an opened door stays open and a dead monster stays dead after a
+reload, and neither the live state nor the save data can pollute each
+other.  All derived output iterates in sorted order, so results are
+deterministic and independent of traversal/insertion order.
+
+Run ``python dungeons.py`` to execute the table-driven test suite and a
+short scripted demo.
 """
-import os
+import copy
 import sys
-from platform import system
-
-from time import sleep
+from dataclasses import dataclass, field
 
 import ascii_images
 
-path = os.getcwd()
 
-def banner(string):
-    operating_system = system().lower()
-    if operating_system == "linux" or operating_system == "linux2":
-        os.system("figlet -c string")
+class ActionError(Exception):
+    """An action could not be applied; the state was rolled back."""
+
+
+@dataclass
+class Room:
+    name: str
+    connections: set = field(default_factory=set)
+
+
+@dataclass
+class Monster:
+    name: str
+    room: str
+    alive: bool = True
+
+
+@dataclass
+class Door:
+    name: str
+    rooms: tuple
+    locked: bool = True
+    open: bool = False
+
+
+@dataclass
+class GameState:
+    rooms: dict = field(default_factory=dict)
+    monsters: dict = field(default_factory=dict)
+    doors: dict = field(default_factory=dict)
+    player: str = ""
+
+
+def build_world(reverse=False):
+    """Build the demo dungeon.
+
+    ``reverse=True`` inserts every entity in the opposite order; the
+    resulting state must behave and describe identically.
+    """
+    state = GameState()
+    rooms = ["cell", "alley", "hall", "kitchen", "library"]
+    doors = [
+        Door("cell_door", ("cell", "alley")),
+        Door("hall_door", ("alley", "hall")),
+        Door("kitchen_door", ("hall", "kitchen")),
+    ]
+    monsters = [
+        Monster("rat", "cell"),
+        Monster("dragon", "alley"),
+        Monster("spider", "kitchen"),
+    ]
+    links = [("hall", "library")]
+    if reverse:
+        rooms, doors, monsters, links = (
+            rooms[::-1], doors[::-1], monsters[::-1], links[::-1])
+    for name in rooms:
+        state.rooms[name] = Room(name)
+    for door in doors:
+        state.doors[door.name] = door
+    for monster in monsters:
+        state.monsters[monster.name] = monster
+    for a, b in links:
+        state.rooms[a].connections.add(b)
+        state.rooms[b].connections.add(a)
+    state.player = "cell"
+    return state
+
+
+def _require(mapping, key, kind):
+    try:
+        return mapping[key]
+    except KeyError:
+        raise ActionError("unknown %s: %r" % (kind, key))
+
+
+def _apply(state, action):
+    kind = action[0]
+    if kind == "unlock_door":
+        door = _require(state.doors, action[1], "door")
+        if not door.locked:
+            raise ActionError("door %r is not locked" % door.name)
+        door.locked = False
+    elif kind == "open_door":
+        door = _require(state.doors, action[1], "door")
+        if door.locked:
+            raise ActionError("door %r is locked" % door.name)
+        if door.open:
+            raise ActionError("door %r is already open" % door.name)
+        door.open = True
+    elif kind == "close_door":
+        door = _require(state.doors, action[1], "door")
+        if not door.open:
+            raise ActionError("door %r is not open" % door.name)
+        door.open = False
+    elif kind == "kill_monster":
+        monster = _require(state.monsters, action[1], "monster")
+        if not monster.alive:
+            raise ActionError("monster %r is already dead" % monster.name)
+        monster.alive = False
+    elif kind == "connect":
+        a, b = action[1], action[2]
+        room_a = _require(state.rooms, a, "room")
+        if a == b:
+            raise ActionError("cannot connect a room to itself")
+        room_a.connections.add(b)  # mutates before the check below on purpose
+        room_b = state.rooms.get(b)
+        if room_b is None:
+            raise ActionError("unknown room: %r" % b)  # rollback must undo the add
+        room_b.connections.add(a)
+    elif kind == "move":
+        target = _require(state.rooms, action[1], "room")
+        if target.name not in reachable_rooms(state, state.player):
+            raise ActionError("no open path from %r to %r" % (state.player, target.name))
+        state.player = target.name
     else:
-        print("\t\t" + string)
+        raise ActionError("unknown action: %r" % (kind,))
 
 
-def game():
+def apply_action(state, action):
+    """Apply ``action`` transactionally.
 
-    ascii_images.ascii_castle()
+    On failure the state is restored from a deep-copy snapshot, so a
+    failed action leaves no trace and cannot pollute later actions.
+    """
+    snapshot = copy.deepcopy(state)
+    try:
+        _apply(state, action)
+    except ActionError:
+        state.rooms = snapshot.rooms
+        state.monsters = snapshot.monsters
+        state.doors = snapshot.doors
+        state.player = snapshot.player
+        raise
 
-    banner("DUNGEONS")
-    print("\t\tI welcome thee to an adventure like none other.")
-    sleep(1)
-    name = input("\t\tWhat shall I call you great Hero: ")
-    sleep(1)
-    print("\t\tWelcome "+name+".  You have been chosen as the defender of all magical creatures.")
-    sleep(1)
-    print("\t\tYour journey will take you through mysterious places, ")
-    print("\t\tThis is one dark journey and you may need to take help from somebody")
-    print("\t\tYou will get one chance to ask for help from the greedy wizard. Remember, he is not your friend and you will have to pay him")
-    sleep(1)
-    opt = ''
-    while opt not in ['y', 'yes']:
-        opt = input("\t\tAre you ready to begin your adventure? (y/n): ").lower()
-        if opt == 'n' or opt == 'no':
-            print("\n\n\t\tSo long and thanks for all the fish!")
-            exit(0)
 
-    print("\n\n\n\t\tWe shall begin Mighty warrior!")
-    dungeons()
+def reachable_rooms(state, room):
+    """Rooms reachable from ``room`` via connections or open doors, sorted."""
+    room = _require(state.rooms, room, "room")
+    result = set(room.connections)
+    for door in state.doors.values():
+        if door.open and room.name in door.rooms:
+            result.update(door.rooms)
+    result.discard(room.name)
+    return sorted(result)
 
-def dungeons():
-    place = 'dungeons'
-    sleep(1)
-    print('\n\n\n')
-    print("\t\t\tDUNGEONS")
-    print("\t\t---------------------------")
-    print("\t\tSelect a training class:")
-    print("\t\t1. I wanna learn everything from basics")
-    print("\t\t2. I wanna learn the good stuff")
-    print("\t\t3. Teach me the Dark Arts!")
-    print("\t\t4. Exit")
+
+def describe(state):
+    """Deterministic textual snapshot; independent of insertion order."""
+    lines = ["player: %s" % state.player]
+    for name in sorted(state.rooms):
+        room = state.rooms[name]
+        lines.append("room %s -> %s" % (name, ",".join(sorted(room.connections)) or "-"))
+    for name in sorted(state.doors):
+        door = state.doors[name]
+        status = "open" if door.open else ("locked" if door.locked else "closed")
+        lines.append("door %s %s=%s" % (name, "-".join(sorted(door.rooms)), status))
+    for name in sorted(state.monsters):
+        monster = state.monsters[name]
+        lines.append("monster %s@%s=%s" % (name, monster.room,
+                                           "alive" if monster.alive else "dead"))
+    return "\n".join(lines)
+
+
+def save_game(state):
+    """Snapshot the state as plain, deep-copied, deterministically ordered data."""
+    return {
+        "player": state.player,
+        "rooms": {name: sorted(state.rooms[name].connections)
+                  for name in sorted(state.rooms)},
+        "monsters": {name: {"room": m.room, "alive": m.alive}
+                     for name, m in sorted(state.monsters.items())},
+        "doors": {name: {"rooms": sorted(d.rooms), "locked": d.locked, "open": d.open}
+                  for name, d in sorted(state.doors.items())},
+    }
+
+
+def load_game(data):
+    """Rebuild a state from save data.
+
+    The input is deep-copied first, so later mutations of ``data`` (or of
+    the returned state) cannot leak into each other.  Door and monster
+    flags are restored exactly as saved -- an open door stays open.
+    """
+    data = copy.deepcopy(data)
+    state = GameState(player=data["player"])
+    for name, connections in data["rooms"].items():
+        state.rooms[name] = Room(name, set(connections))
+    for name, info in data["monsters"].items():
+        state.monsters[name] = Monster(name, info["room"], info["alive"])
+    for name, info in data["doors"].items():
+        state.doors[name] = Door(name, tuple(info["rooms"]), info["locked"], info["open"])
+    return state
+
+
+# ---------------------------------------------------------------- tests
+
+def _expect_failure(state, action):
+    """Assert ``action`` fails and the state survives it byte-for-byte."""
+    snapshot = copy.deepcopy(state)
+    try:
+        apply_action(state, action)
+    except ActionError:
+        pass
+    else:
+        raise AssertionError("action %r should have failed" % (action,))
+    assert state == snapshot, "failed action %r polluted the state" % (action,)
+    return snapshot
+
+
+def check_unlock_door(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    assert state.doors["cell_door"].locked is False
+    assert state.doors["cell_door"].open is False
+
+
+def check_open_unlocked_door(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    assert state.doors["cell_door"].open is True
+
+
+def check_open_locked_door_rolls_back(state):
+    before = _expect_failure(state, ("open_door", "cell_door"))
+    assert state.doors["cell_door"].locked is True
+    assert state.doors["cell_door"].open is False
+    assert state == before
+
+
+def check_double_open_rolls_back(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    _expect_failure(state, ("open_door", "cell_door"))
+    assert state.doors["cell_door"].open is True
+
+
+def check_close_open_door(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    apply_action(state, ("close_door", "cell_door"))
+    assert state.doors["cell_door"].open is False
+
+
+def check_close_closed_door_rolls_back(state):
+    _expect_failure(state, ("close_door", "cell_door"))
+    assert state.doors["cell_door"].open is False
+
+
+def check_kill_monster(state):
+    apply_action(state, ("kill_monster", "dragon"))
+    assert state.monsters["dragon"].alive is False
+    assert state.monsters["rat"].alive is True  # unrelated monster untouched
+
+
+def check_kill_dead_monster_rolls_back(state):
+    apply_action(state, ("kill_monster", "dragon"))
+    _expect_failure(state, ("kill_monster", "dragon"))
+    assert state.monsters["dragon"].alive is False
+
+
+def check_unknown_monster_rolls_back(state):
+    _expect_failure(state, ("kill_monster", "ghost"))
+    assert set(state.monsters) == {"rat", "dragon", "spider"}
+
+
+def check_connect_rooms(state):
+    apply_action(state, ("connect", "cell", "library"))
+    assert "library" in state.rooms["cell"].connections
+    assert "cell" in state.rooms["library"].connections
+
+
+def check_connect_missing_room_rolls_back(state):
+    _expect_failure(state, ("connect", "cell", "nowhere"))
+    assert "nowhere" not in state.rooms["cell"].connections
+    assert state.rooms["cell"].connections == set()
+
+
+def check_move_through_connection(state):
+    apply_action(state, ("connect", "cell", "library"))
+    apply_action(state, ("move", "library"))
+    assert state.player == "library"
+
+
+def check_move_through_closed_door_rolls_back(state):
+    _expect_failure(state, ("move", "alley"))
+    assert state.player == "cell"
+
+
+def check_move_through_open_door(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    apply_action(state, ("move", "alley"))
+    assert state.player == "alley"
+
+
+def check_failure_does_not_pollute_later_actions(state):
+    _expect_failure(state, ("open_door", "cell_door"))
+    _expect_failure(state, ("kill_monster", "ghost"))
+    _expect_failure(state, ("move", "alley"))
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    apply_action(state, ("move", "alley"))
+    assert state.player == "alley"
+    assert state.doors["cell_door"].open is True
+
+
+def check_save_load_keeps_door_open(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    loaded = load_game(save_game(state))
+    assert loaded.doors["cell_door"].open is True   # regression: stays open
+    assert loaded.doors["cell_door"].locked is False
+    assert loaded.doors["hall_door"].locked is True
+
+
+def check_save_load_keeps_monster_dead(state):
+    apply_action(state, ("kill_monster", "dragon"))
+    loaded = load_game(save_game(state))
+    assert loaded.monsters["dragon"].alive is False
+    assert loaded.monsters["rat"].alive is True
+
+
+def check_save_data_is_deep_copied(state):
+    apply_action(state, ("unlock_door", "cell_door"))
+    apply_action(state, ("open_door", "cell_door"))
+    data = save_game(state)
+    loaded = load_game(data)
+    loaded.doors["cell_door"].open = False      # mutate the loaded state
+    loaded.monsters["rat"].alive = False
+    assert data["doors"]["cell_door"]["open"] is True   # save data unpolluted
+    assert data["monsters"]["rat"]["alive"] is True
+    data["doors"]["cell_door"]["open"] = False  # tamper with the save data
+    data["monsters"]["rat"]["alive"] = False
+    assert state.doors["cell_door"].open is True        # live state unpolluted
+    assert state.monsters["rat"].alive is True
+    assert loaded.doors["cell_door"].open is False      # earlier copy unaffected
+
+
+def check_describe_is_order_independent(state):
+    other = build_world(reverse=True)
+    assert describe(state) == describe(other)
+    apply_action(state, ("connect", "cell", "library"))
+    apply_action(other, ("connect", "cell", "library"))
+    assert describe(state) == describe(other)
+
+
+def check_reachable_is_sorted_and_order_independent(state):
+    apply_action(state, ("connect", "cell", "library"))
+    apply_action(state, ("connect", "cell", "hall"))
+    other = build_world(reverse=True)
+    apply_action(other, ("connect", "cell", "hall"))
+    apply_action(other, ("connect", "cell", "library"))
+    assert reachable_rooms(state, "cell") == ["hall", "library"]
+    assert reachable_rooms(state, "cell") == reachable_rooms(other, "cell")
+
+
+TESTS = [
+    ("unlock door marks it unlocked", check_unlock_door),
+    ("open unlocked door succeeds", check_open_unlocked_door),
+    ("open locked door fails and rolls back", check_open_locked_door_rolls_back),
+    ("double open fails and rolls back", check_double_open_rolls_back),
+    ("close open door succeeds", check_close_open_door),
+    ("close closed door fails and rolls back", check_close_closed_door_rolls_back),
+    ("kill monster succeeds", check_kill_monster),
+    ("kill dead monster fails and rolls back", check_kill_dead_monster_rolls_back),
+    ("kill unknown monster fails and rolls back", check_unknown_monster_rolls_back),
+    ("connect rooms links both ways", check_connect_rooms),
+    ("connect to missing room rolls back partial write", check_connect_missing_room_rolls_back),
+    ("move through connection succeeds", check_move_through_connection),
+    ("move through closed door fails and rolls back", check_move_through_closed_door_rolls_back),
+    ("move through open door succeeds", check_move_through_open_door),
+    ("failures do not pollute later actions", check_failure_does_not_pollute_later_actions),
+    ("save/load keeps opened door open", check_save_load_keeps_door_open),
+    ("save/load keeps dead monster dead", check_save_load_keeps_monster_dead),
+    ("save data and state are deep-copy isolated", check_save_data_is_deep_copied),
+    ("describe is independent of insertion order", check_describe_is_order_independent),
+    ("reachable rooms are sorted and order independent", check_reachable_is_sorted_and_order_independent),
+]
+
+
+def run_tests():
+    failures = []
+    for name, check in TESTS:
+        try:
+            check(build_world())
+        except (AssertionError, ActionError) as exc:
+            failures.append((name, exc))
+            print("FAIL %s: %s" % (name, exc))
+        else:
+            print("PASS %s" % name)
+    print("%d/%d tests passed" % (len(TESTS) - len(failures), len(TESTS)))
+    return not failures
+
+
+def demo():
+    state = build_world()
+    script = [
+        ("kill_monster", "rat"),
+        ("unlock_door", "cell_door"),
+        ("open_door", "cell_door"),
+        ("move", "alley"),
+        ("kill_monster", "dragon"),
+    ]
+    for action in script:
+        apply_action(state, action)
+    print(describe(state))
     print()
-    sleep(1)
-    num = input("\t\tEnter a number:")
-    print('\n\n\n\n\n')
-    if num == '1':
-        banner("SPELL CLASS")
-        print("\n\n\t\tYou are in a dark room.")
-        print()
-        print("\t\tYou can use the 'ls' command in the game as well")
-        print("\t\tas on a linux system to look around the directory/location.")
-
-        print()
-        print("\t\tYou can use the 'cat <scroll/filename>' command in the game as well")
-        print("\t\tas on a linux system to read the contents of a scroll(file).")
-        os.system("touch metal_bars.dragon scroll_of_knowledge.dragon broken_bones.dragon dead_rats.dragon a_locked_door.dragon")
-        os.system('printf "\t\tDoor is locked! Try reading the scroll_of_knowledge" > a_locked_door.dragon')
-        os.system('printf "\t\tWhat can you catch but never throw?" > scroll_of_knowledge.dragon')
-        while True:
-            opt = input("\t\tInput: ").lower()
-            if opt == 'cold':
-                print("\t\tCold it is! Just like your movement inside this cell. ")
-                print("\t\tRead the Scroll of Cold Movement! (Did you not see the scroll before?)")
-                os.system('touch scroll_of_cold_movement.dragon')
-                os.system('printf "             You can use the cd <roomname/directory_name> command to move through rooms\n \
-             in the game and directories in the terminal.\n \
-             Enter the new room the has appeared!\n             (Only files have the extension .dragon)" > scroll_of_cold_movement.dragon')
-                os.system('mkdir alley')
-                os.system('touch alley/empty_alley.dragon')
-            elif opt == 'cd alley':
-                os.chdir('alley')
-                print('\n\n\n')
-                banner("ALLEY")
-                sleep(1)
-                print("\t\tYou entered an abandoned Alley.")
-                sleep(1)
-                place = 'alley'
-                break
-            else:
-                os.system(opt)
-            print()
-
-        if place == 'alley':
-            alley()
-
-    elif num == '2':
-        banner("ARCHERY")
-        os.system('mkdir archery')
-        os.chdir('archery')
-        print("\n\n\t\tSometimes you need a little more precision.")
-        print()
-        print("\t\tYou can use the cat command to view multiple files at once.")
-        print("\t\tYou can write 'cat <file1> <file2> <file2>")
-        print("\t\tAnd the contents of three files will be concatenated.")
-        sleep(2)
-        print("\t\tYou can see that the current folder contains a number of files.")
-        print("\t\tWith names riddleA, riddleB, riddleC and so on....")
-        print("\t\tEach file contains just a single letter of the riddle.")
-        sleep(1)
-        print("\t\tTo view all the files, you can use */? operator.")
-        for i,j in enumerate("What is at the end of rainbow?"):
-            os.system('echo '+j+' > riddle'+chr(i+65)+'.dragon')
-        opt = ''
-        cpMoney = "cp money.dragon"
-        mvMoney = "mv money.dragon"
-        while True:
-            opt = input("\t\tInput: ").lower()
-
-            if opt == 'w':
-                os.system('rm *.dragon')
-                print("\t\tYou hit that target spot on!")
-                print("\t\tAll the following commands would have worked:")
-                print("\t\tcat *")
-                print("\t\tcat riddle?.dragon")
-                print("\t\tcat riddle*")
-                print('\n\n\n')
-                print("\t\tOh no, a vicious dragon just appeared to end your journey")
-                print("\t\tThis is your chance to take help from the wizard")
-                print("\t\tBut he demands double the money you have right now\n")
-                print("\t\tTo copy a file with the \"cp\" command, pass the name of the file to be copied and then the destination")
-                print("\t\tYou have money in the file money.dragon,read the file contents and copy it using cp command to double your money")
-                print("\t\tYou can write `cp fileToBeCopied duplicateFileName`")
-                os.system('echo 100 Gold Coins'+' > money.dragon')
-            if opt != cpMoney and cpMoney in opt:
-                os.system("ls")
-                print("\t\tYou have successfully doubled your money, the wizard teleported you to another world (directory)")
-                os.system("mkdir safeChamber")
-                os.system("cp money.dragon safeChamber")
-                os.chdir("safeChamber")
-                print("\t\tWith a new skill (command) called `mv`, you can move your files to another world (directory)")
-                print("\t\tSo next time you want to teleport to a new world you can take your files with you")
-                print("\t\tTo move a file into a directory using the `mv` command, pass the name of the file and then the directory")
-                print("\t\tYou can write `mv fileToBeMoved newDirectory`")
-            if mvMoney in opt and opt!=mvMoney:
-                print('\n\n\n')
-                print("\t\tYou have successfully moved the file money.dragon to a new world (directory)")
-                print("\t\tinput `dungeons` at any time to return to dungeons")
-                king()
-            if opt == "dungeons":
-                print('\n\n\n')
-                print('See you at your next Training!')
-                dungeons()
-            else:
-                os.system(opt)
-            print()
-    elif num == '3':
-        print("This tale is to be continued!")
-
-    elif num == '4':
-        print("Until next time...")
-
-
-def alley():
-    place = 'alley'
     ascii_images.ascii_dragon()
-    print("\t\tYou have answer a riddle to go to the next room.")
-    sleep(1)
-    print("\t\tAnswer wrong and the dragon would eat you!!! JK, or am I?")
-    sleep(1)
-    print("\t\tWhat disappears as soon as  you say its name    ")
-    ans = ''
-    while True:
-        ans =  input("\t\tInput: ").lower()
-        if ans == 'silence':
-            print('\t\tA new path appeared. Go to THE GREAT HALL!')
-            sleep(1)
-            print("\t\tUse cd command to go to the The Great Hall!")
-            os.system('mkdir the_great_hall')
-            sleep(1)
-
-        elif ans == 'cd the_great_hall':
-            os.chdir('the_great_hall')
-            print('\n\n\n')
-            banner("THE GREAT HALL")
-            sleep(1)
-            place = 'hall'
-            break
-
-        else:
-            os.system(ans)
-        print()
-
-    if place == 'hall':
-        hall()
-
-def hall():
-    sleep(2)
-    ascii_images.ascii_hall()
-    print('             Try to read scroll in The Great Hall to unlock the path!')
-    os.system('touch the_great_hall.dragon')
-    os.system('printf "             What goes up, but never comes down? " > the_great_hall.dragon')
-    ans1 = ''
-    while True:
-        ans1 = input("\t\tInput: ").lower()
-        if ans1 == 'age':
-            print('\t\tA new path appeared.')
-            sleep(1)
-            print("\t\tUse cd command to go to the kitchen! ")
-            os.system('mkdir the_royal_kitchen')
-
-        elif ans1 == 'cd the_royal_kitchen':
-            os.chdir('the_royal_kitchen')
-            print('\n\n\n')
-            banner("THE ROYAL KITCHEN")
-            sleep(1)
-            place = 'kitchen'
-            break
-
-        else:
-            os.system(ans1)
-        print()
-
-    if place == 'kitchen':
-        kitchen()
-
-def kitchen():
-    sleep(2)
-    ascii_iamges.ascii_couldron()
-    print("\t\tTry to read kitchen.dragon")
-    os.system('touch kitchen.dragon')
-    os.system('printf "             What is easy to get into, but hard to get out of ? " > kitchen.dragon')
-    ans2 = ''
-    while True:
-
-        ans2 = input("\t\tInput:").lower()
-        if ans2 == 'trouble' or ans2 == 'vim' or ans2 == 'relationship':
-
-            print("\t\tA new path appeared.")
-            sleep(1)
-            print("\t\tUse cd command to go to the library!")
-            os.system('mkdir infinite_library')
-
-        elif ans2 == 'cd infinite_library':
-            os.chdir('infinite_library')
-            print('\n\n\n')
-            banner("INFINITE LIBRARY")
-            sleep(1)
-            place = 'library'
-            break
-
-        else:
-            os.system(ans2)
-        print()
-
-    if place == 'library':
-        library()
-
-def library():
-    ascii_images.ascii_scrolls()
-    place = 'library'
-    print("\t\tYou have reached the Infinite Library!")
-    sleep(1)
-    print("\t\tI wonder if you remember the path you followed to come here...")
-    sleep(1)
-    print("\t\tYou can use the \'pwd\' command to know your location in dungeon\n \
-             as well as in the linux system.")
-    sleep(1)
-    print("\t\tpwd stands for present working directory")
-    sleep(1)
-    print("\t\tand shows you the name as well as the location of your current directory.")
-    print("\t\t---------------------------------------------")
-    opt = ''
-    while True:
-        sleep(1)
-        opt = input("\t\tTry it: ")
-        if opt == 'pwd':
-            os.system('pwd')
-            print()
-            print("\t\tTo go back to a previous room (directory),")
-            sleep(1)
-            print("\t\tyou can use the 'cd ..' command")
-            sleep(1)
-            print("\t\tTo go back to multiple directories,")
-            sleep(1)
-            print("\t\tyou can use the 'cd ../../..' command")
-            sleep(1)
-            print("\t\tfor example 'cd ../../../..' would take you back to Dungeons")
-
-        elif opt == 'cd ../../../..':
-            place = 'dungeons'
-            print("Taking you back to Dungeons\n\n\n\n\n")
-            break
-        else:
-            print("\t\tWrong spell\n")
-
-    if place == 'dungeons':
-        dungeons()
-
-def king():
-    banner("POISON")
-    print("\t\tYou were just poisoned. You no longer remember who you are.")
-    sleep(0.5)
-    print("\t\tTry reading the scroll in the room. ")
-    os.system('touch king_riddle.dragon')
-    os.system('printf " Two bodies have I, though both joined in one. The more still I stand, the quicker I run." > king_riddle.dragon ')
-    res_1 = ''
-    while 1:
-        res_1 = input("             Input: ").lower()
-        if res_1 == 'hourglass':
-            print("Use 'whoami' command in game as well as in linux system to know your identity.")
-        elif res_1 == 'whoami':
-            os.system(res_1)
-            print()
-            print("\t\tTime to move on to next task!\n\n\n")
-            touch()
-        else:
-            os.system(res_1)
-        print()
-
-def touch():
-    banner("SUMMONING")
-    #os.system('mkdir door')
-    os.system(' touch riddle.dragon')
-    os.system('printf "First think of the person who lives in disguise,\n \
-                       Who deals in secrets and tells naught but lies.\n \
-                       Next, tell me what’s always the last thing to mend,\n \
-                       The middle of middle and end of the end?\n \
-    		       And finally give me the sound often heard\n \
-    		       During the search for a hard-to-find word.\n \
-     		       Now string them together, and answer me this,\n \
-    		       Which creature would you be unwilling to kiss??" > riddle.dragon')
-
-    print("\t\tYour next task is to master the summoning spell.")
-    print("\t\tYou can create forge new items (files) using the 'touch' command")
-    print("\t\tFor example you can write 'touch sword.dragon' to create a sword file with extension dragon.")
-    sleep(1)
-    print("\t\tSolve the riddle in the scroll and create a dragon file using the answer.")
-    opt = ''
-    while True:
-        opt = input("\n\t\tInput: ").lower()
-        os.system(opt)
-        #if 'escape' in os.listdir():
-        #    print("\t\tYou found a way out, It teleported you back to the dungeons\n\n\n")
-        #    dungeons()
-
-        if 'spider.dragon' in os.listdir():
-            print("\t\tYou created a spider!!!")
-            print("\t\tNow you have to escape from the spider...")
-            print("\t\tUse 'mkdir <directory_name>' command to create a new directory named escape")
-            print("\t\tand use the 'cd' command to enter it.")
-            find()
+    print("The dragon is slain; the cell door stands open. Saving and reloading...")
+    loaded = load_game(save_game(state))
+    assert describe(loaded) == describe(state)
+    print("Reloaded state is identical -- open doors stay open, dead monsters stay dead.")
 
 
-def find():
-    banner("SECRET KEY")
-    ascii_images.ascii_key()
-    os.system('mkdir book desk chest box table barrel vase')
-    with open('book/.hidden.key', 'w') as f:
-        f.write("To use this key to unlock the door, create a directory called key and use 'cd' to enter it")
-    print("\t\tAs you escape from the spider, the door shuts behind you.")
-    print("\t\tOn the opposite end of the room, there is a door but it is locked.")
-    print("\t\tUse the 'find' command to locate the key to escape.")
-    print("\t\tUse 'find . -name' and your knowledge of wild cards to search for the key.")
-    opt = ''
-    while True:
-        opt = input("\n\t\tInput: ").lower()
-        os.system(opt)
-        
-        if 'key' in os.listdir():
-            print("\t\tYou found a way out. It teleported you back to the dungeons.\n\n\n")
-            dungeons()
+def main():
+    ascii_images.ascii_castle()
+    print("\t\tDUNGEONS -- state engine self-test\n")
+    ok = run_tests()
+    print()
+    if ok:
+        demo()
+    return 0 if ok else 1
 
 
-# def previous_moves():
-#     print('Do you want to know what were your previous moves?')
-#     print('try to open moves_riddle ')
-#     os.system('touch moves_riddle.dragon')
-#     os.system('printf " I speak without a mouth and hear without ears. I have no body, but I come alive with wind. What am I?  " > moves_riddle.dragon')
-#     res_2 = ''
-#     while 1:
-#         res_2 = input("             Input: ").lower()
-#         if res_2 == 'echo':
-#             print("Use 'history' command  in game as well as in the linux system to see your previous commands")
-
-#         elif res_2 == 'history':
-#             os.system(res_2)
-#             print()
-#             print("             Time to go back to Dungeons!\n\n\n")
-#             dungeons()
-
-#         else:
-#             os.system(res_2)
-#         print()
-
-
-try:
-    game()
-
-except KeyboardInterrupt:
-    os.chdir(path)
-    os.system('rm *.dragon')
-    os.system('rm -rd alley')
-    os.system('rm -rd archery')
-    banner("FAREWELL")
-    exit()
-
-
-# change cd command from chdir to system
+if __name__ == "__main__":
+    sys.exit(main())
